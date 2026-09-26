@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Google OAuth credentials
+token.json
+client_secret_971531000181-4isesv3tika4vf59ctfju1l54h85bdcd.apps.googleusercontent.com.json
+credentials.json
+
+# Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
