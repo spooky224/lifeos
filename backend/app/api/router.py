@@ -27,6 +27,10 @@ class ApprovalRequest(BaseModel):
     decision: str
 
 
+class ResumeRequest(BaseModel):
+    answer: str
+
+
 class TaskStatusRequest(BaseModel):
     status: TaskStatus
 
@@ -435,7 +439,11 @@ def start_task(task_id: int):
             "task": {
                 "id": task.id,
                 "title": task.title,
-                "status": task.status.value,
+                "status": (
+                    task.status.value
+                    if hasattr(task.status, "value")
+                    else task.status
+                ),
                 "actual_start": (
                     task.actual_start.isoformat()
                     if task.actual_start
@@ -473,7 +481,11 @@ def complete_task(task_id: int):
             "task": {
                 "id": task.id,
                 "title": task.title,
-                "status": task.status.value,
+                "status": (
+                    task.status.value
+                    if hasattr(task.status, "value")
+                    else task.status
+                ),
                 "actual_start": (
                     task.actual_start.isoformat()
                     if task.actual_start
@@ -635,6 +647,49 @@ def approve_action(
             detail=str(exc),
         )
         
+@router.post("/chat/resume/{thread_id}")
+def resume_chat(thread_id: str, request: ResumeRequest):
+    """
+    Resume a paused graph run (any interrupt() — task clarification,
+    not just calendar approval) with a free-text answer.
+    """
+
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
+
+    try:
+        from langgraph.types import Command
+
+        result = graph.invoke(
+            Command(resume=request.answer),
+            config,
+        )
+
+        if "__interrupt__" in result:
+            interrupt_data = result["__interrupt__"][0]
+
+            return {
+                "status": "approval_required",
+                "message": interrupt_data.value,
+                "thread_id": thread_id,
+            }
+
+        return {
+            "status": "completed",
+            "result": result,
+            "thread_id": thread_id,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
 @router.post("/routines/generate")
 def generate_routine_tasks(target_date: date | None = None):
     session = SessionLocal()

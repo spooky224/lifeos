@@ -38,15 +38,24 @@ export default function ChatPage() {
     setLoading(true);
 
     try {
-      const response = await fetch(`${API_URL}/chat`, {
+      // If LIFEOS is mid-question (calendar approval OR a task
+      // clarification), this message is the ANSWER to that question,
+      // not a new unrelated request — resume the paused graph run
+      // instead of starting a fresh one.
+      const endpoint = pendingApproval
+        ? `${API_URL}/chat/resume/${threadId}`
+        : `${API_URL}/chat`;
+
+      const body = pendingApproval
+        ? { answer: userMessage }
+        : { message: userMessage, thread_id: threadId };
+
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          message: userMessage,
-          thread_id: threadId,
-        }),
+        body: JSON.stringify(body),
       });
 
       const data = await response.json();
@@ -66,11 +75,18 @@ export default function ChatPage() {
 
         setPendingApproval(true);
       } else {
+        setPendingApproval(false);
+
+        const finalResponse =
+          data.result?.final_response ||
+          data.result?.messages?.at(-1)?.content ||
+          "Done, but LIFEOS did not return a summary message.";
+
         setMessages((current) => [
           ...current,
           {
             role: "assistant",
-            content: "Done. LIFEOS completed the requested action.",
+            content: finalResponse,
           },
         ]);
       }
@@ -115,14 +131,17 @@ export default function ChatPage() {
 
       setPendingApproval(false);
 
+      const finalResponse =
+        data.result?.messages?.at(-1)?.content ||
+        (decision === "approved"
+          ? "Approved. The action has been executed and persisted."
+          : "Understood. I cancelled the proposed action.");
+
       setMessages((current) => [
         ...current,
         {
           role: "assistant",
-          content:
-            decision === "approved"
-              ? "Approved. The action has been executed and persisted."
-              : "Understood. I cancelled the proposed action.",
+          content: finalResponse,
         },
       ]);
     } catch (error) {
@@ -235,35 +254,46 @@ export default function ChatPage() {
                 {pendingApproval && (
                   <div className="rounded-2xl border border-zinc-700 bg-zinc-900 p-6">
                     <p className="text-sm font-medium">
-                      Human approval required
+                      {messages.at(-1)?.content.includes(
+                        "Should I add this event"
+                      )
+                        ? "Human approval required"
+                        : "LIFEOS needs more information"}
                     </p>
 
                     <p className="mt-2 text-sm text-zinc-500">
-                      LIFEOS has proposed an action. Review it above before
-                      allowing it to modify your calendar.
+                      {messages.at(-1)?.content.includes(
+                        "Should I add this event"
+                      )
+                        ? "Review the proposed action above, then approve, reject, or type a different instruction below."
+                        : "Type your answer below to continue."}
                     </p>
 
-                    <div className="mt-5 flex gap-3">
-                      <button
-                        onClick={() =>
-                          handleApproval("approved")
-                        }
-                        disabled={loading}
-                        className="rounded-xl bg-white px-5 py-3 text-sm font-medium text-black hover:bg-zinc-200 disabled:opacity-50"
-                      >
-                        Approve
-                      </button>
+                    {messages.at(-1)?.content.includes(
+                      "Should I add this event"
+                    ) && (
+                      <div className="mt-5 flex gap-3">
+                        <button
+                          onClick={() =>
+                            handleApproval("approved")
+                          }
+                          disabled={loading}
+                          className="rounded-xl bg-white px-5 py-3 text-sm font-medium text-black hover:bg-zinc-200 disabled:opacity-50"
+                        >
+                          Approve
+                        </button>
 
-                      <button
-                        onClick={() =>
-                          handleApproval("rejected")
-                        }
-                        disabled={loading}
-                        className="rounded-xl border border-zinc-700 px-5 py-3 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
-                      >
-                        Reject
-                      </button>
-                    </div>
+                        <button
+                          onClick={() =>
+                            handleApproval("rejected")
+                          }
+                          disabled={loading}
+                          className="rounded-xl border border-zinc-700 px-5 py-3 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

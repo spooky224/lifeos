@@ -35,3 +35,8 @@ class LifeOSState(TypedDict, total=False):
     final_response: str
     
     schedule_requested: bool
+
+    # Deterministic anchor for vague references ("the last task",
+    # "reschedule it") — set whenever a task is created or touched,
+    # so resolution doesn't have to guess from a flat unordered list.
+    last_task_id: int

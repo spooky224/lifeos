@@ -1,8 +1,10 @@
 import os
+import re
 from datetime import datetime
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from app.db.session import SessionLocal
@@ -11,6 +13,49 @@ from app.models.task import TaskStatus
 from app.services.task_service import TaskService
 
 load_dotenv()
+
+
+class DurationExtraction(BaseModel):
+    minutes: int | None = Field(
+        description=(
+            "The duration described in the text, converted to a "
+            "whole number of minutes. Null if no duration is stated."
+        )
+    )
+
+
+def _parse_duration_minutes(text: str) -> int | None:
+    text = text.strip()
+
+    bare_number = re.fullmatch(r"(\d+)", text)
+    if bare_number:
+        return int(bare_number.group(1))
+
+    duration_model = model.with_structured_output(
+        DurationExtraction,
+        method="json_mode",
+    )
+
+    try:
+        result = duration_model.invoke(f"""
+Convert this duration description to a whole number of minutes.
+
+Text: "{text}"
+
+Examples:
+"1 hour" -> 60
+"1h30" -> 90
+"1h30minutes approximately" -> 90
+"an hour and a half" -> 90
+"45 mins" -> 45
+"half an hour" -> 30
+
+Return ONLY valid JSON:
+{{"minutes": 90}}
+""")
+        return result.minutes
+    except Exception:
+        return None
 
 
 class TaskOperationContext(BaseModel):
@@ -23,7 +68,7 @@ class TaskOperationContext(BaseModel):
     )
     title: str | None = None
     estimated_duration_minutes: int | None = None
-    priority: str = "medium"
+    priority: str | None = None
     description: str | None = None
     status: str | None = None
     reasoning: str
@@ -100,15 +145,38 @@ Return ONLY valid JSON:
 }}
 """
 
-        result = task_model.invoke(prompt)
+        try:
+            result = task_model.invoke(prompt)
+        except Exception:
+            clarification = (
+                "I couldn't quite parse that task request. Could you "
+                "rephrase it with a clear title, and how long it should "
+                "take?"
+            )
+            return {
+                "schedule_requested": False,
+                "final_response": clarification,
+                "messages": state.get("messages", []) + [
+                    {"role": "task_agent", "content": clarification}
+                ],
+            }
 
         if not result.title:
-            raise ValueError("Could not determine the task title.")
-
-        if not result.estimated_duration_minutes:
-            raise ValueError(
-                "Could not determine the task duration."
+            answer = interrupt(
+                "What should I call this task? I couldn't tell from "
+                "your message."
             )
+            result.title = answer.strip()
+
+        while not result.estimated_duration_minutes:
+            answer = interrupt(
+                f"How long should '{result.title}' take?"
+            )
+            result.estimated_duration_minutes = _parse_duration_minutes(
+                answer
+            )
+
+        priority = result.priority or "medium"
 
         session = SessionLocal()
 
@@ -119,7 +187,7 @@ Return ONLY valid JSON:
                 title=result.title,
                 estimated_duration_minutes=result.estimated_duration_minutes,
                 description=result.description,
-                priority=result.priority,
+                priority=priority,
             )
 
             session.commit()
@@ -138,6 +206,7 @@ Return ONLY valid JSON:
                     "priority": task.priority,
                     "goal_id": task.goal_id,
                 },
+                "last_task_id": task.id,
                 "schedule_requested": result.schedule_requested,
                 "messages": (
                     state.get("messages", [])

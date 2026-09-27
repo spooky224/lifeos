@@ -34,7 +34,6 @@ def approval_node(state: LifeOSState) -> LifeOSState:
     proposal = state["proposed_actions"][0]
 
     proposal_type = proposal.get("type")
-    print("DEBUG CALENDAR PROPOSAL:", proposal)
 
     if proposal_type == "create_recurring_calendar_event":
 
@@ -409,6 +408,15 @@ def route_after_approval(state: LifeOSState):
 
     return "replan"
 
+def route_after_calendar(state: LifeOSState):
+    if not state.get("proposed_actions"):
+        # calendar_agent couldn't resolve a task and already
+        # produced a final_response asking the user to clarify.
+        return END
+
+    return "approval"
+
+
 def route_after_task(state: LifeOSState):
     if (
         state["intent"] == "task_create"
@@ -555,12 +563,16 @@ def build_graph():
     )
 
     # =========================================================
-    # CALENDAR → APPROVAL
+    # CALENDAR → APPROVAL (or END if clarification is needed)
     # =========================================================
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "calendar_agent",
-        "approval",
+        route_after_calendar,
+        {
+            "approval": "approval",
+            END: END,
+        },
     )
 
     # =========================================================
@@ -608,4 +620,4 @@ def build_graph():
         checkpointer=checkpointer
     )
 
-    return compiled_graph   
+    return compiled_graph

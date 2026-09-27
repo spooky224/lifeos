@@ -10,8 +10,8 @@ def calculate_available_slots(
     events: list[dict[str, Any]],
     start_date: datetime,
     end_date: datetime,
-    workday_start: int = 9,
-    workday_end: int = 18,
+    workday_start: int = 6,
+    workday_end: int = 23,
     minimum_duration_minutes: int = 30,
 ) -> list[dict[str, str]]:
     """
