@@ -13,13 +13,24 @@ class UserIntent(BaseModel):
     intent: str = Field(
         description=(
             "Main intent of the request. "
-            "Must be one of: goal, task_create, routine, "
-            "calendar, task_update, other."
+            "Must be one of: conversation, goal, task_create, "
+            "routine, calendar, task_update, other."
         )
     )
 
     reasoning: str = Field(
         description="Short explanation of why this intent was identified."
+    )
+
+    resolved_request: str = Field(
+        default="",
+        description=(
+            "For an action intent, rewrite the CURRENT request as a self-contained "
+            "instruction using relevant facts from recent conversation. Resolve "
+            "references such as 'that' or 'it', preserve constraints, and do not add "
+            "actions the user did not request. For conversation, repeat the current "
+            "request unchanged."
+        ),
     )
 
 
@@ -33,6 +44,7 @@ intent_model = model.with_structured_output(UserIntent)
 
 def personal_agent(state: LifeOSState) -> LifeOSState:
     user_request = state["user_request"]
+    conversation_history = state.get("conversation_history", [])[-12:]
 
     prompt = f"""
 You are the Personal Agent of LIFEOS.
@@ -92,12 +104,49 @@ Available intents:
    - "I postponed my presentation."
    - "I'm working on my AI project."
 
-6. other
-   The request does not currently belong to one of
-   the specialized agents.
+6. conversation
+   The user is talking naturally, reflecting, sharing feelings,
+   asking for advice or general information, greeting you, or
+   continuing a discussion without asking LIFEOS to change data.
+
+   Examples:
+   - "Hey, how are you?"
+   - "I'm tired and feel like I made no progress today."
+   - "What do you think I should focus on?"
+   - "Why is it so hard to stay consistent?"
+
+7. other
+   Use only when no intent fits confidently. Prefer conversation
+   over other for normal human dialogue.
 
 Important classification rules:
+# LIFEOS_CONTEXT_INTENT_FIX_V1
+CURRENT-REQUEST PRECEDENCE (CRITICAL):
+- Classify the user's CURRENT message first. Use earlier conversation only to
+  resolve references such as "that goal" or "the task we discussed"; never let
+  the previous topic override a different project explicitly named now.
+- A request like "I want to work on LIFEOS for two hours this week, preferably
+  after 1 PM" is a one-time work task with scheduling constraints. Classify it
+  as task_create (not goal, task_update, or a continuation of the previous goal).
+- Do not attach a task to the previously discussed goal merely because that
+  goal appears in conversation history. A task may be independent (goal_id=None).
+  Link it to a goal only when the current request explicitly names that goal or
+  clearly asks to add the task to it.
+- Use goal only when the current message asks to create/define a larger goal,
+  or explicitly asks to add work to a particular existing goal. For example,
+  "Let's turn that into a goal" refers to the immediately preceding problem;
+  it does not make every later work request part of that goal.
+- If the current request names a different project, preserve that project in
+  the task title and scheduling context. Do not reuse a previous goal/task title.
 
+
+- Use CONVERSATION by default when the user is talking, thinking aloud,
+  asking for advice, or sharing an experience rather than requesting a
+  concrete change to LIFEOS data.
+- A follow-up such as "let's turn that into a goal" is an action request;
+  use the surrounding conversation to resolve what "that" refers to.
+- Do not create goals, tasks, routines, or calendar events merely because
+  the user discusses them. They must express an intention to act.
 - A recurring activity is a ROUTINE request.
 - A one-time activity is a TASK_CREATE request.
 - A larger objective involving multiple activities is a GOAL request.
@@ -110,10 +159,20 @@ Important classification rules:
 - If the user refers to a task that already exists and asks
   when or where it should be scheduled, classify it as CALENDAR.
 
-User request:
+Recent conversation (oldest to newest):
+{conversation_history}
+
+Current user request:
 {user_request}
 
-Return the structured intent only.
+Use the recent conversation to resolve references such as "it", "that",
+"the project", or "let's do it". Classify the CURRENT request, not the
+previous turn.
+- For an action intent, set resolved_request to a self-contained version of
+  the current action, carrying forward only relevant context and constraints.
+  Do not turn discussion into action. For conversation intent, keep the
+  current message unchanged in resolved_request.
+- Return the structured intent only.
 """
 
     try:
@@ -131,8 +190,16 @@ Return the structured intent only.
             ],
         }
 
+    resolved_request = (result.resolved_request or "").strip()
     return {
         "intent": result.intent,
+        # Downstream domain agents receive a self-contained request.
+        # Original wording remains in conversation_history.
+        "user_request": (
+            resolved_request
+            if result.intent not in ("conversation", "other") and resolved_request
+            else user_request
+        ),
         "topic_switch": False,
         "messages": state.get("messages", []) + [
             {

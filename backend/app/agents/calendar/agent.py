@@ -20,6 +20,116 @@ load_dotenv()
 LIFEOS_TIMEZONE = ZoneInfo("Africa/Tunis")
 
 
+# LIFEOS_CALENDAR_PROPOSAL_VALIDATION_V1
+
+def _validate_calendar_proposal(
+    proposed_start: str,
+    proposed_end: str,
+    available_slots: list[dict[str, str]],
+    expected_duration_minutes: int | None,
+    user_request: str,
+    now: datetime,
+) -> str | None:
+    """Return a safety issue if the model's proposal violates known constraints."""
+    try:
+        start = datetime.fromisoformat(proposed_start)
+        end = datetime.fromisoformat(proposed_end)
+    except (TypeError, ValueError):
+        return "the proposed start or end is not a valid ISO datetime"
+
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=LIFEOS_TIMEZONE)
+    else:
+        start = start.astimezone(LIFEOS_TIMEZONE)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=LIFEOS_TIMEZONE)
+    else:
+        end = end.astimezone(LIFEOS_TIMEZONE)
+
+    if end <= start:
+        return "the end time is not later than the start time"
+
+    actual_minutes = int((end - start).total_seconds() // 60)
+    if expected_duration_minutes and actual_minutes != expected_duration_minutes:
+        return (
+            f"the proposal lasts {actual_minutes} minutes, but the task requires "
+            f"{expected_duration_minutes} minutes"
+        )
+
+    local_now = now.astimezone(LIFEOS_TIMEZONE) if now.tzinfo else now.replace(tzinfo=LIFEOS_TIMEZONE)
+    if start < local_now:
+        return "the proposed start time is in the past"
+    if end > local_now + timedelta(days=14, seconds=1):
+        return "the proposal falls outside the calendar availability window"
+
+    contained_in_free_slot = False
+    for slot in available_slots:
+        try:
+            slot_start = datetime.fromisoformat(slot["start"])
+            slot_end = datetime.fromisoformat(slot["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if slot_start.tzinfo is None:
+            slot_start = slot_start.replace(tzinfo=LIFEOS_TIMEZONE)
+        else:
+            slot_start = slot_start.astimezone(LIFEOS_TIMEZONE)
+        if slot_end.tzinfo is None:
+            slot_end = slot_end.replace(tzinfo=LIFEOS_TIMEZONE)
+        else:
+            slot_end = slot_end.astimezone(LIFEOS_TIMEZONE)
+        if slot_start <= start and end <= slot_end:
+            contained_in_free_slot = True
+            break
+    if not contained_in_free_slot:
+        return "the proposed time is not fully contained in a verified free calendar slot"
+
+    request_lower = user_request.lower()
+
+    # Honor an explicitly requested calendar week instead of silently using
+    # any date in the wider rolling 14-day availability window.
+    if re.search(r"\bthis week\b", request_lower):
+        monday = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=local_now.weekday())
+        next_monday = monday + timedelta(days=7)
+        if start < monday or end > next_monday:
+            return "the proposed event is outside the current calendar week"
+    elif re.search(r"\bnext week\b", request_lower):
+        monday = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=local_now.weekday()) + timedelta(days=7)
+        next_monday = monday + timedelta(days=7)
+        if start < monday or end > next_monday:
+            return "the proposed event is outside next calendar week"
+
+    # Check simple explicit clock boundaries such as "after 1 PM" or
+    # "before 5:30 PM". Treat the boundary itself as acceptable for the
+    # natural-language preference "after 1 PM".
+    after_match = re.search(
+        r"\bafter\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        request_lower,
+    )
+    if after_match:
+        hour = int(after_match.group(1)) % 12
+        if after_match.group(3) == "pm":
+            hour += 12
+        minute = int(after_match.group(2) or 0)
+        boundary_minutes = hour * 60 + minute
+        if start.hour * 60 + start.minute < boundary_minutes:
+            return "the proposed start time is earlier than the requested time-of-day boundary"
+
+    before_match = re.search(
+        r"\bbefore\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        request_lower,
+    )
+    if before_match:
+        hour = int(before_match.group(1)) % 12
+        if before_match.group(3) == "pm":
+            hour += 12
+        minute = int(before_match.group(2) or 0)
+        boundary_minutes = hour * 60 + minute
+        if end.hour * 60 + end.minute > boundary_minutes:
+            return "the proposed end time is later than the requested time-of-day boundary"
+
+    return None
+
+
 class TaskSelection(BaseModel):
     task_id: int | None = Field(
         description=(
@@ -388,6 +498,29 @@ Return exactly this structure:
             ],
         }
 
+    validation_error = _validate_calendar_proposal(
+        proposed_start=result.proposed_start,
+        proposed_end=result.proposed_end,
+        available_slots=available_slots,
+        expected_duration_minutes=task.get("estimated_duration_minutes"),
+        user_request=state["user_request"],
+        now=now,
+    )
+    if validation_error:
+        clarification = (
+            "I found a possible time, but it did not pass my calendar safety checks: "
+            f"{validation_error}. I have not added anything to your calendar. "
+            "Would you like me to try another slot?"
+        )
+        return {
+            "last_task_id": task_id,
+            "proposed_actions": [],
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "calendar_agent", "content": clarification}
+            ],
+        }
+
     return {
         "calendar_context": calendar_context,
         "last_task_id": task_id,
@@ -401,7 +534,7 @@ Return exactly this structure:
                 "task_id": task_id,
                 "calendar_event_id": calendar_event_id,
                 "google_event_id": google_event_id,
-                "title": result.title,
+                "title": task["title"],
                 "start": result.proposed_start,
                 "end": result.proposed_end,
                 "explanation": result.explanation,

@@ -19,6 +19,7 @@ from app.repositories.tasks import TaskRepository
 from app.repositories.routines import RoutineRepository
 
 from app.agents.personal.agent import personal_agent
+from app.agents.companion_agent import companion_agent
 from app.agents.goals.agent import goal_agent
 from app.agents.calendar.agent import calendar_agent
 from app.agents.routines.agent import routine_agent
@@ -29,37 +30,54 @@ from app.agents.supervisor.agent import supervisor_agent
 from app.models.task import TaskStatus
 
 
+
+def _format_approval_datetime(value: str) -> datetime:
+    """Parse an ISO timestamp, including Z suffixes, for display only."""
+    normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    # LIFEOS stores/schedules in Africa/Tunis; the input timestamps are expected
+    # to carry their timezone. Preserve the parsed instant for local display.
+    return parsed
+
+def _format_approval_slot(start_value: str, end_value: str) -> str:
+    """Render ISO timestamps as a concise, friendly local date/time range."""
+    start = _format_approval_datetime(start_value)
+    end = _format_approval_datetime(end_value)
+    date_label = start.strftime("%A, %B %-d, %Y")
+    start_label = start.strftime("%-I:%M %p")
+    end_label = end.strftime("%-I:%M %p")
+    minutes = max(0, int((end - start).total_seconds() // 60))
+    if minutes % 60 == 0:
+        duration_label = f"{minutes // 60} hour" + ("s" if minutes != 60 else "")
+    else:
+        hours, remainder = divmod(minutes, 60)
+        duration_label = (f"{hours} hour" + ("s" if hours != 1 else "") + " " if hours else "") + f"{remainder} minutes"
+    return f"{date_label}\n{start_label} – {end_label} · {duration_label}"
+
 def approval_node(state: LifeOSState) -> LifeOSState:
-
     proposal = state["proposed_actions"][0]
-
     proposal_type = proposal.get("type")
+    slot_label = _format_approval_slot(proposal["start"], proposal["end"])
 
     if proposal_type == "create_recurring_calendar_event":
-
         approval_message = (
-            "Okay, I’ll set this recurring routine on your "
-            "Google Calendar:\n\n"
-            f"Routine: {proposal['title']}\n"
-            f"Start: {proposal['start']}\n"
-            f"End: {proposal['end']}\n"
-            f"Recurrence: {proposal['recurrence_rule']}\n\n"
-            f"Reason: {proposal['explanation']}\n\n"
-            "Should I add it to your calendar?"
+            "Here's the proposed recurring routine for your Google Calendar:\n\n"
+            f"**{proposal['title']}**\n"
+            f"{slot_label}\n"
+            f"Repeats: {proposal['recurrence_rule']}\n\n"
+            f"Why: {proposal['explanation']}\n\n"
+            "Should I add it to your calendar? Nothing will be scheduled until you approve."
         )
-
     else:
-
         approval_message = (
-            "Should I add this event to your calendar?\n\n"
-            f"Title: {proposal['title']}\n"
-            f"Start: {proposal['start']}\n"
-            f"End: {proposal['end']}\n\n"
-            f"Reason: {proposal['explanation']}"
+            "Here's a time I'd recommend for your calendar:\n\n"
+            f"**{proposal['title']}**\n"
+            f"{slot_label}\n\n"
+            f"Why this time: {proposal['explanation']}\n\n"
+            "Should I add this event to your calendar? Nothing will be scheduled until you approve."
         )
 
     decision = interrupt(approval_message)
-
     return {
         "pending_approval": False,
         "approval_decision": decision,
@@ -82,7 +100,8 @@ def route_after_personal(state: LifeOSState):
     if intent in ("task_create", "task_update"):
         return "task_agent"
 
-    return "replan"
+    # Ordinary dialogue is a valid outcome, not a rejected action.
+    return "conversation_agent"
 
 def execute_calendar_action(
     state: LifeOSState,
@@ -457,6 +476,11 @@ def build_graph():
     )
 
     graph.add_node(
+        "conversation_agent",
+        companion_agent,
+    )
+
+    graph.add_node(
         "goal_agent",
         goal_agent,
     )
@@ -525,6 +549,7 @@ def build_graph():
             "routine_agent": "routine_agent",
             "calendar_agent": "calendar_agent",
             "task_agent": "task_agent",
+            "conversation_agent": "conversation_agent",
             "replan": "replan",
         },
     )
@@ -596,6 +621,11 @@ def build_graph():
             "calendar_agent": "calendar_agent",
             END: END,
         },
+    )
+
+    graph.add_edge(
+        "conversation_agent",
+        END,
     )
 
     graph.add_edge(

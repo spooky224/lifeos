@@ -20,6 +20,43 @@ router = APIRouter()
 graph = build_graph()
 
 
+def _conversation_history(config: dict) -> list[dict[str, str]]:
+    """Read the conversation transcript from this LangGraph thread."""
+    snapshot = graph.get_state(config)
+    values = getattr(snapshot, "values", {}) or {}
+    return list(values.get("conversation_history", []))
+
+
+def _record_assistant_reply(
+    config: dict,
+    history_with_user: list[dict[str, str]],
+    reply: str | None,
+) -> None:
+    if not reply or not reply.strip():
+        return
+    updated_history = (
+        history_with_user + [{"role": "assistant", "content": reply.strip()}]
+    )[-24:]
+    graph.update_state(config, {"conversation_history": updated_history})
+
+
+def _reply_from_result(result: dict, previous_message_count: int = 0) -> str | None:
+    final_response = result.get("final_response")
+    if isinstance(final_response, str) and final_response.strip():
+        return final_response.strip()
+
+    messages = result.get("messages", [])
+    new_messages = messages[previous_message_count:] if previous_message_count else messages
+    for message in reversed(new_messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "")
+        content = message.get("content")
+        if role != "personal_agent" and isinstance(content, str) and content.strip():
+            return content.strip()
+    return None
+
+
 class ChatRequest(BaseModel):
     message: str
     thread_id: str = "lifeos-api"
@@ -319,10 +356,36 @@ def chat(request: ChatRequest):
     }
 
     try:
+        previous_history = _conversation_history(config)
+        history_with_user = (
+            previous_history + [{"role": "user", "content": request.message}]
+        )[-23:]
+        previous_snapshot = graph.get_state(config)
+        previous_values = getattr(previous_snapshot, "values", {}) or {}
+        previous_message_count = len(previous_values.get("messages", []))
+
         # pending_reschedule is overwritten on EVERY turn so it can never
         # leak from a previous request via the checkpoint.
         input_state = {
             "user_request": request.message,
+            "conversation_history": history_with_user,
+            # Clear turn-scoped outputs from the previous checkpoint.
+            # Keep last_task_id / last_goal_id as deliberate reference anchors.
+            "intent": None,
+            "task_context": {},
+            "goal_context": {},
+            "routine_context": {},
+            "calendar_context": {},
+            "proposed_actions": [],
+            "pending_approval": False,
+            "approval_message": None,
+            "approval_decision": None,
+            "execution_results": [],
+            "lifecycle_issues": [],
+            "lifecycle_actions": [],
+            "schedule_requested": False,
+            "topic_switch": False,
+            "final_response": None,
             "pending_reschedule": None,
         }
 
@@ -377,11 +440,25 @@ def chat(request: ChatRequest):
         if "__interrupt__" in result:
             interrupt_data = result["__interrupt__"][0]
 
+            # The user's turn is already part of the graph input/checkpoint.
+            # Leave the paused interrupt untouched until it is resumed.
             return {
                 "status": "approval_required",
                 "message": interrupt_data.value,
                 "thread_id": request.thread_id,
             }
+
+        # Prefer this turn's response. A checkpoint may contain older messages,
+        # so never let a previous final_response silently win this turn.
+        current_reply = _reply_from_result(result, previous_message_count)
+        if current_reply:
+            result["final_response"] = current_reply
+
+        _record_assistant_reply(
+            config,
+            history_with_user,
+            current_reply,
+        )
 
         return {
             "status": "completed",
@@ -695,6 +772,9 @@ def approve_action(
             config,
         )
 
+        history = _conversation_history(config)
+        _record_assistant_reply(config, history, _reply_from_result(result))
+
         return {
             "status": "completed",
             "thread_id": thread_id,
@@ -736,6 +816,9 @@ def resume_chat(thread_id: str, request: ResumeRequest):
                 "message": interrupt_data.value,
                 "thread_id": thread_id,
             }
+
+        history = _conversation_history(config)
+        _record_assistant_reply(config, history, _reply_from_result(result))
 
         return {
             "status": "completed",

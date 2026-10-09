@@ -4,6 +4,7 @@ from typing import Any, TypedDict
 class LifeOSState(TypedDict, total=False):
     # Conversation
     user_request: str
+    conversation_history: list[dict[str, str]]
     messages: list[dict[str, Any]]
 
     # Understanding
