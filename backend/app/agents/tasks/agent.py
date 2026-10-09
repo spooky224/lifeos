@@ -7,6 +7,7 @@ from langchain_groq import ChatGroq
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from app.agents.interrupt_utils import ask, TopicSwitchDetected
 from app.db.session import SessionLocal
 from app.graph.state import LifeOSState
 from app.models.task import TaskStatus
@@ -161,20 +162,28 @@ Return ONLY valid JSON:
                 ],
             }
 
-        if not result.title:
-            answer = interrupt(
-                "What should I call this task? I couldn't tell from "
-                "your message."
-            )
-            result.title = answer.strip()
+        try:
+            if not result.title:
+                answer = ask(
+                    "What should I call this task? I couldn't tell "
+                    "from your message."
+                )
+                result.title = answer.strip()
 
-        while not result.estimated_duration_minutes:
-            answer = interrupt(
-                f"How long should '{result.title}' take?"
-            )
-            result.estimated_duration_minutes = _parse_duration_minutes(
-                answer
-            )
+            while not result.estimated_duration_minutes:
+                answer = ask(
+                    f"How long should '{result.title}' take?"
+                )
+                result.estimated_duration_minutes = (
+                    _parse_duration_minutes(answer)
+                )
+
+        except TopicSwitchDetected as switch:
+            return {
+                "user_request": switch.new_request,
+                "topic_switch": True,
+                "schedule_requested": False,
+            }
 
         priority = result.priority or "medium"
 
@@ -249,6 +258,16 @@ Interpret:
 - "I'm working on my AI project"
   -> in_progress
 
+- "cancel my AI project" / "cancel it" / "I don't want to do this
+  anymore" / "scrap that task"
+  -> cancelled
+
+Note the difference: "missed" means the user didn't do it but it
+still should have happened (a failure/lapse). "cancelled" means the
+user no longer wants to do it at all (a deliberate choice to drop
+it). Do not default to "missed" when the user is clearly choosing
+to cancel/drop/scrap something.
+
 Identify the task reference.
 
 User request:
@@ -263,12 +282,24 @@ Return ONLY valid JSON:
     "estimated_duration_minutes": null,
     "priority": "medium",
     "description": null,
-    "status": "completed | missed | postponed | in_progress",
+    "status": "completed | missed | postponed | in_progress | cancelled",
     "reasoning": "..."
 }}
 """
 
-    result = task_model.invoke(prompt)
+    try:
+        result = task_model.invoke(prompt)
+    except Exception:
+        clarification = (
+            "I couldn't quite understand that update. Could you "
+            "rephrase which task, and what happened to it?"
+        )
+        return {
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "task_agent", "content": clarification}
+            ],
+        }
 
     session = SessionLocal()
 
@@ -278,7 +309,16 @@ Return ONLY valid JSON:
         tasks = service.list_tasks()
 
         if not tasks:
-            raise ValueError("No tasks exist in LIFEOS.")
+            clarification = (
+                "You don't have any tasks yet, so there's nothing "
+                "to update. Want to create one?"
+            )
+            return {
+                "final_response": clarification,
+                "messages": state.get("messages", []) + [
+                    {"role": "task_agent", "content": clarification}
+                ],
+            }
 
         identification_prompt = f"""
 You are identifying an existing LIFEOS task.
@@ -293,8 +333,7 @@ Available tasks:
 ]}
 
 Return the ID of the task that best matches the user's reference.
-
-Do not invent an ID.
+If nothing clearly matches, return null. Do not invent an ID.
 
 Return ONLY valid JSON:
 
@@ -304,7 +343,7 @@ Return ONLY valid JSON:
 """
 
         class TaskSelection(BaseModel):
-            task_id: int
+            task_id: int | None = None
 
         selector = model.with_structured_output(
             TaskSelection,
@@ -312,24 +351,83 @@ Return ONLY valid JSON:
         )
 
         selection = selector.invoke(identification_prompt)
+        task = (
+            service.get_task(selection.task_id)
+            if selection.task_id is not None
+            else None
+        )
 
-        task = service.get_task(selection.task_id)
+        try:
+            while task is None:
+                answer = ask(
+                    "I couldn't tell which task you mean. Could you "
+                    "name it more specifically?"
+                )
+                reselection = selector.invoke(f"""
+You are identifying an existing LIFEOS task.
 
-        if task is None:
-            raise ValueError(
-                f"Task #{selection.task_id} was not found."
+User's clarification:
+{answer}
+
+Available tasks:
+{[
+    {"id": t.id, "title": t.title, "status": str(t.status)}
+    for t in tasks
+]}
+
+Return the ID of the task that best matches. If nothing clearly
+matches, return null. Do not invent an ID.
+
+Return ONLY valid JSON:
+{{"task_id": 123}}
+""")
+                task = (
+                    service.get_task(reselection.task_id)
+                    if reselection.task_id is not None
+                    else None
+                )
+
+        except TopicSwitchDetected as switch:
+            return {
+                "user_request": switch.new_request,
+                "topic_switch": True,
+            }
+
+        try:
+            new_status = TaskStatus(result.status)
+        except (ValueError, TypeError):
+            clarification = (
+                f"What actually happened with '{task.title}'? "
+                "(completed, missed, postponed, cancelled, or in progress)"
             )
+            return {
+                "final_response": clarification,
+                "messages": state.get("messages", []) + [
+                    {"role": "task_agent", "content": clarification}
+                ],
+            }
 
-        new_status = TaskStatus(result.status)
+        try:
+            if new_status == TaskStatus.IN_PROGRESS:
+                task = service.start_task(task.id)
 
-        if new_status == TaskStatus.IN_PROGRESS:
-            task = service.start_task(task.id)
+            elif new_status == TaskStatus.COMPLETED:
+                task = service.complete_task(task.id)
 
-        elif new_status == TaskStatus.COMPLETED:
-            task = service.complete_task(task.id)
+            else:
+                task = service.update_status(task, new_status)
 
-        else:
-            task = service.update_status(task, new_status)
+        except ValueError as exc:
+            # An invalid transition (e.g. cancelling an already-
+            # completed task) is a normal outcome to explain, not a
+            # crash.
+            clarification = str(exc)
+            return {
+                "final_response": clarification,
+                "messages": state.get("messages", []) + [
+                    {"role": "task_agent", "content": clarification}
+                ],
+            }
 
         session.commit()
 
@@ -339,6 +437,7 @@ Return ONLY valid JSON:
         )
 
         return {
+            "last_task_id": task.id,
             "execution_results": [
                 {
                     "type": "task_status_update",

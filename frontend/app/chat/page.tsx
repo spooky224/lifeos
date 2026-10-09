@@ -2,7 +2,9 @@
 
 import { useState } from "react";
 import Link from "next/link";
-
+import NotificationTray, {
+  LifeosNotification,
+} from "@/components/NotificationTray";
 const API_URL = "http://127.0.0.1:8000/api";
 
 type Message = {
@@ -18,6 +20,23 @@ export default function ChatPage() {
   );
   const [pendingApproval, setPendingApproval] = useState(false);
   const [loading, setLoading] = useState(false);
+  // Set when a notification hands a specific task to the conversation.
+  const [focusTask, setFocusTask] = useState<{
+    id: number;
+    title: string;
+  } | null>(null);
+
+  function handleReschedule(notification: LifeosNotification) {
+    setFocusTask({ id: notification.task_id, title: notification.title });
+
+    setMessages((current) => [
+      ...current,
+      {
+        role: "assistant",
+        content: `Let's reschedule "${notification.title}". When should I move it to? Give me a time like "tomorrow at 5pm", or say "as soon as possible".`,
+      },
+    ]);
+  }
 
   async function sendMessage() {
     if (!message.trim() || loading) {
@@ -48,7 +67,7 @@ export default function ChatPage() {
 
       const body = pendingApproval
         ? { answer: userMessage }
-        : { message: userMessage, thread_id: threadId };
+        : { message: userMessage, thread_id: threadId, focus_task_id: focusTask?.id ?? null };
 
       const response = await fetch(endpoint, {
         method: "POST",
@@ -130,6 +149,9 @@ export default function ChatPage() {
       }
 
       setPendingApproval(false);
+      if (decision === "approved") {
+        setFocusTask(null);
+      }
 
       const finalResponse =
         data.result?.messages?.at(-1)?.content ||
@@ -198,7 +220,12 @@ export default function ChatPage() {
             Personal Command Center
           </h2>
         </header>
-
+        <div className="mx-auto w-full max-w-4xl px-8 pt-6 empty:hidden">
+          <NotificationTray
+            onReschedule={handleReschedule}
+            rescheduleDisabled={pendingApproval}
+          />
+        </div>
         <div className="flex flex-1 flex-col">
           <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col px-8 py-10">
             {messages.length === 0 ? (
@@ -300,6 +327,23 @@ export default function ChatPage() {
             )}
 
             <div className="mt-8">
+              {focusTask && (
+                  <div className="mb-3 flex items-center justify-between rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-2 text-xs text-zinc-400">
+                    <span>
+                      Rescheduling{" "}
+                      <span className="text-zinc-200">
+                        &ldquo;{focusTask.title}&rdquo;
+                      </span>
+                    </span>
+
+                    <button
+                      onClick={() => setFocusTask(null)}
+                      className="text-zinc-500 hover:text-white"
+                    >
+                      Dismiss ✕
+                    </button>
+                  </div>
+              )}
               <div className="flex items-end gap-3 rounded-2xl border border-zinc-700 bg-zinc-900 p-3">
                 <textarea
                   value={message}

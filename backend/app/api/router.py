@@ -14,6 +14,8 @@ from app.services.routine_service import RoutineService
 from app.services.task_service import TaskService
 from app.models.routine import Routine
 from app.repositories.routines import RoutineRepository
+from app.models.calendar_event import CalendarEventStatus
+from app.services.lifecycle_service import LifecycleService
 router = APIRouter()
 graph = build_graph()
 
@@ -21,6 +23,14 @@ graph = build_graph()
 class ChatRequest(BaseModel):
     message: str
     thread_id: str = "lifeos-api"
+    # Set by the UI when a notification's 'Reschedule' button hands a
+    # specific task to the conversation.
+    focus_task_id: int | None = None
+
+
+class NotificationActionRequest(BaseModel):
+    task_id: int
+    action: str
 
 
 class ApprovalRequest(BaseModel):
@@ -309,32 +319,36 @@ def chat(request: ChatRequest):
     }
 
     try:
-        current_state = graph.get_state(config)
-        state_values = current_state.values
-
+        # pending_reschedule is overwritten on EVERY turn so it can never
+        # leak from a previous request via the checkpoint.
         input_state = {
             "user_request": request.message,
+            "pending_reschedule": None,
         }
 
-        pending_reschedule = state_values.get("pending_reschedule")
-
-        if pending_reschedule:
-            input_state["pending_reschedule"] = pending_reschedule
-
+        if request.focus_task_id is not None:
             session = SessionLocal()
 
             try:
-                task_repository = TaskRepository(session)
-
-                task = task_repository.get_by_id(
-                    pending_reschedule["task_id"]
+                task = TaskRepository(session).get_by_id(
+                    request.focus_task_id
                 )
 
                 if task is None:
-                    raise ValueError(
-                        f"Task #{pending_reschedule['task_id']} not found."
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Task #{request.focus_task_id} not found.",
                     )
 
+                scheduled = [
+                    e
+                    for e in CalendarEventRepository(
+                        session
+                    ).list_by_task(task.id)
+                    if e.status == CalendarEventStatus.SCHEDULED
+                ]
+
+                input_state["last_task_id"] = task.id
                 input_state["task_context"] = {
                     "task_id": task.id,
                     "title": task.title,
@@ -342,7 +356,15 @@ def chat(request: ChatRequest):
                     "estimated_duration_minutes": (
                         task.estimated_duration_minutes
                     ),
+                    "priority": task.priority,
+                    "goal_id": task.goal_id,
                 }
+
+                if scheduled:
+                    input_state["pending_reschedule"] = {
+                        "task_id": task.id,
+                        "calendar_event_id": scheduled[-1].id,
+                    }
 
             finally:
                 session.close()
@@ -367,12 +389,14 @@ def chat(request: ChatRequest):
             "thread_id": request.thread_id,
         }
 
+    except HTTPException:
+        raise
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=str(exc),
         )
-
 @router.get("/goals")
 def get_goals():
     session = SessionLocal()
@@ -596,7 +620,43 @@ def get_calendar():
     finally:
         session.close()
 
+@router.get("/notifications")
+def list_notifications():
+    session = SessionLocal()
 
+    try:
+        return {
+            "notifications": LifecycleService(session).list_notifications()
+        }
+
+    finally:
+        session.close()
+
+
+@router.post("/notifications/action")
+def notification_action(request: NotificationActionRequest):
+    session = SessionLocal()
+
+    try:
+        LifecycleService(session).apply_action(
+            request.task_id,
+            request.action,
+        )
+        session.commit()
+
+        return {"status": "ok"}
+
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    finally:
+        session.close()
+        
 @router.post("/approvals/{thread_id}")
 def approve_action(
     thread_id: str,

@@ -30,11 +30,17 @@ class TaskSelection(BaseModel):
 
 
 class CalendarProposal(BaseModel):
-    proposed_start: str = Field(
-        description="Proposed start date and time in ISO format."
+    proposed_start: str | None = Field(
+        default=None,
+        description=(
+            "Proposed start date and time in ISO format. Null if "
+            "no available slot is long enough for the requested "
+            "duration."
+        ),
     )
 
-    proposed_end: str = Field(
+    proposed_end: str | None = Field(
+        default=None,
         description="Proposed end date and time in ISO format."
     )
 
@@ -43,7 +49,7 @@ class CalendarProposal(BaseModel):
     )
 
     explanation: str = Field(
-        description="Why this time slot is appropriate."
+        description="Why this time slot is appropriate, or why none fit."
     )
 
 
@@ -206,6 +212,8 @@ def calendar_agent(state: LifeOSState) -> LifeOSState:
     google_event_id = None
     calendar_event_id = None
     is_reschedule = bool(pending_reschedule)
+    original_start = None
+    original_end = None
 
     if not pending_reschedule and intent == "calendar":
         # This task may already have an active calendar event.
@@ -224,6 +232,8 @@ def calendar_agent(state: LifeOSState) -> LifeOSState:
                 existing = existing_events[-1]
                 calendar_event_id = existing.id
                 google_event_id = existing.google_event_id
+                original_start = existing.start_time
+                original_end = existing.end_time
                 is_reschedule = True
 
         finally:
@@ -247,50 +257,53 @@ def calendar_agent(state: LifeOSState) -> LifeOSState:
                 )
 
             google_event_id = calendar_event.google_event_id
+            original_start = calendar_event.start_time
+            original_end = calendar_event.end_time
 
         finally:
             session.close()
 
     now = datetime.now(LIFEOS_TIMEZONE)
 
-    # Temporary scheduling window:
-    # current week.
-    #
-    # Later this will come directly from the
-    # user's interpreted scheduling intention.
-    week_start = (
-        now.replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        - timedelta(days=now.weekday())
-    )
+    # Rolling 2-week scheduling window from "now" -- NOT "this
+    # calendar week". A hardcoded Monday-Sunday window makes anything
+    # near a week boundary invisible to the slot finder (e.g. a
+    # Sunday request for "next Tuesday" would have no slots to pick
+    # from at all).
+    window_start = now
+    window_end = now + timedelta(days=14)
 
-    start_of_week = max(
-        week_start,
-        now,
-    )
-
-    end_of_week = week_start + timedelta(days=7)
     # Get REAL events only inside the scheduling window.
     events = get_calendar_events(
-        start_datetime=start_of_week,
-        end_datetime=end_of_week,
+        start_datetime=window_start,
+        end_datetime=window_end,
     )
 
     # Calculate REAL available slots.
     available_slots = find_available_slots(
         events=events,
-        start_datetime=start_of_week,
-        end_datetime=end_of_week,
+        start_datetime=window_start,
+        end_datetime=window_end,
     )
 
     calendar_context = {
         "timezone": "Africa/Tunis",
         "available_slots": available_slots,
     }
+
+    original_time_context = (
+        f"""
+This is a RESCHEDULE of an existing event, originally scheduled:
+{original_start.isoformat()} to {original_end.isoformat()}
+
+If the user's request only mentions a TIME (e.g. "move it to 7pm")
+with no date, keep the SAME DATE as the original ({original_start.date().isoformat()})
+and only change the time. Only use a different date if the user
+explicitly mentions one (e.g. "tomorrow", "next Monday", "Friday").
+"""
+        if is_reschedule and original_start
+        else ""
+    )
 
     prompt = f"""
 You are the Calendar Agent of LIFEOS.
@@ -302,7 +315,7 @@ Original user request:
 
 Task:
 {task}
-
+{original_time_context}
 Available calendar slots:
 {available_slots}
 
@@ -344,7 +357,36 @@ Return exactly this structure:
 }}
 """
 
-    result = calendar_model.invoke(prompt)
+    try:
+        result = calendar_model.invoke(prompt)
+    except Exception:
+        clarification = (
+            f"I couldn't find a way to schedule '{task['title']}' -- "
+            "could you give a shorter duration or a different time?"
+        )
+        return {
+            "last_task_id": task_id,
+            "proposed_actions": [],
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "calendar_agent", "content": clarification}
+            ],
+        }
+
+    if not result.proposed_start or not result.proposed_end:
+        clarification = (
+            f"I couldn't fit '{result.title}' into any available "
+            f"slot. {result.explanation} Could you give a shorter "
+            "duration or a different time frame?"
+        )
+        return {
+            "last_task_id": task_id,
+            "proposed_actions": [],
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "calendar_agent", "content": clarification}
+            ],
+        }
 
     return {
         "calendar_context": calendar_context,

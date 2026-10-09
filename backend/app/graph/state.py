@@ -40,3 +40,13 @@ class LifeOSState(TypedDict, total=False):
     # "reschedule it") — set whenever a task is created or touched,
     # so resolution doesn't have to guess from a flat unordered list.
     last_task_id: int
+
+    # Same idea for goals: "add another task to it", "what's left
+    # on that project" need a deterministic anchor too.
+    last_goal_id: int
+
+    # Set when a mid-clarification reply turns out to be a brand new,
+    # unrelated request rather than an answer -- signals the graph
+    # to hand control back to the Personal Agent instead of forcing
+    # the reply through whatever parser was waiting for an answer.
+    topic_switch: bool      

@@ -417,6 +417,13 @@ def route_after_calendar(state: LifeOSState):
     return "approval"
 
 
+def route_after_goal(state: LifeOSState):
+    if state.get("schedule_requested", False):
+        return "calendar_agent"
+
+    return END
+
+
 def route_after_task(state: LifeOSState):
     if (
         state["intent"] == "task_create"
@@ -427,17 +434,15 @@ def route_after_task(state: LifeOSState):
     return END
 
 
-def route_after_lifecycle(state: LifeOSState):
-    actions = state.get("lifecycle_actions", [])
 
-    if any(action.get("requires_user") for action in actions):
-        return "supervisor_agent"
+def route_start(state: LifeOSState):
+    # A notification's "Reschedule" button hands a specific task to the
+    # chat. /chat sets pending_reschedule for that request only, so this
+    # is deterministic: no intent guessing needed.
+    if state.get("pending_reschedule"):
+        return "calendar_agent"
 
     return "personal_agent"
-
-def route_after_supervisor(state: LifeOSState):
-    return END
-
 def build_graph():
 
     graph = StateGraph(LifeOSState)
@@ -471,15 +476,7 @@ def build_graph():
         task_agent,
     )
     
-    graph.add_node(
-        "lifecycle_agent",
-        lifecycle_agent,
-    )
-    
-    graph.add_node(
-        "supervisor_agent",
-        supervisor_agent,
-    )
+
 
     # =========================================================
     # HUMAN APPROVAL
@@ -508,26 +505,14 @@ def build_graph():
     # START
     # =========================================================
 
-    graph.add_edge(START, "lifecycle_agent")
-
     graph.add_conditional_edges(
-        "lifecycle_agent",
-        route_after_lifecycle,
+        START,
+        route_start,
         {
-            "supervisor_agent": "supervisor_agent",
+            "calendar_agent": "calendar_agent",
             "personal_agent": "personal_agent",
         },
     )
-
-    graph.add_conditional_edges(
-        "supervisor_agent",
-        route_after_supervisor,
-        {
-            "personal_agent": "personal_agent",
-            END: END,
-        },
-    )
-
     # =========================================================
     # PERSONAL AGENT ROUTING
     # =========================================================
@@ -545,12 +530,16 @@ def build_graph():
     )
 
     # =========================================================
-    # GOAL → CALENDAR
+    # GOAL → CALENDAR (or END if scheduling wasn't requested)
     # =========================================================
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "goal_agent",
-        "calendar_agent",
+        route_after_goal,
+        {
+            "calendar_agent": "calendar_agent",
+            END: END,
+        },
     )
 
     # =========================================================

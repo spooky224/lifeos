@@ -1,10 +1,14 @@
 import os
+import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
+
+from app.agents.interrupt_utils import ask, TopicSwitchDetected
 
 from app.db.session import SessionLocal
 from app.graph.state import LifeOSState
@@ -60,6 +64,78 @@ model = ChatGroq(
 )
 
 routine_model = model.with_structured_output(RoutineContext)
+
+
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+
+def _parse_days_of_week(text: str) -> list[int] | None:
+    text = text.lower()
+
+    days = sorted({
+        value
+        for name, value in WEEKDAY_NAMES.items()
+        if re.search(rf"\b{name}\b", text)
+    })
+
+    return days or None
+
+
+def _parse_month_days(text: str) -> list[int] | None:
+    numbers = [
+        int(n) for n in re.findall(r"\b(\d{1,2})\b", text)
+        if 1 <= int(n) <= 31
+    ]
+
+    return numbers or None
+
+
+class TimeExtraction(BaseModel):
+    time_24h: str | None = Field(
+        description=(
+            "The time converted to 24-hour HH:MM format, "
+            "or null if unclear."
+        )
+    )
+
+
+def _parse_preferred_time(text: str) -> str | None:
+    bare = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text.strip())
+
+    if bare:
+        return text.strip()
+
+    time_model = model.with_structured_output(
+        TimeExtraction,
+        method="json_mode",
+    )
+
+    try:
+        result = time_model.invoke(f"""
+Convert this time description to 24-hour HH:MM format.
+
+Text: "{text}"
+
+Examples:
+"7pm" -> "19:00"
+"7 in the evening" -> "19:00"
+"half past 8 in the morning" -> "08:30"
+"noon" -> "12:00"
+
+Return ONLY valid JSON:
+{{"time_24h": "19:00"}}
+""")
+        return result.time_24h
+    except Exception:
+        return None
 
 
 def _build_recurrence_rule(
@@ -194,6 +270,59 @@ def _get_next_occurrence(
     )
 
 
+def _resolve_routine_schedule(
+    result: "RoutineContext",
+) -> tuple[time, str, datetime]:
+    """
+    Fill in whatever the extraction missed (time, days) by asking
+    the user directly via interrupt(), instead of crashing. Returns
+    the resolved preferred_time, recurrence_rule, and start_datetime.
+    """
+
+    preferred_time_str = result.preferred_time
+
+    while not preferred_time_str:
+        answer = ask(
+            f"What time should '{result.name}' happen?"
+        )
+        preferred_time_str = _parse_preferred_time(answer)
+
+    preferred_time = time.fromisoformat(preferred_time_str)
+
+    days_of_week = result.days_of_week
+
+    if result.frequency == "weekly":
+        while not days_of_week:
+            answer = ask(
+                f"Which day(s) of the week should '{result.name}' "
+                "happen on?"
+            )
+            days_of_week = _parse_days_of_week(answer)
+
+    elif result.frequency == "monthly":
+        while not days_of_week:
+            answer = ask(
+                f"Which day(s) of the month should '{result.name}' "
+                "happen on (e.g. the 1st and 15th)?"
+            )
+            days_of_week = _parse_month_days(answer)
+
+    recurrence_rule = _build_recurrence_rule(
+        result.frequency,
+        days_of_week,
+    )
+
+    start_datetime = _get_next_occurrence(
+        result.frequency,
+        preferred_time,
+        days_of_week,
+    )
+
+    result.days_of_week = days_of_week
+
+    return preferred_time, recurrence_rule, start_datetime
+
+
 def routine_agent(state: LifeOSState) -> LifeOSState:
 
     user_request = state["user_request"]
@@ -241,33 +370,38 @@ Rules:
 9. If no priority is specified:
    use medium.
 
-10. Do not invent unrelated information.
+10. Do not invent unrelated information. Leave preferred_time
+    or days_of_week null rather than guessing if the user
+    genuinely didn't say.
 
 User request:
 {user_request}
 """
 
-    result = routine_model.invoke(prompt)
-
-    if not result.preferred_time:
-        raise ValueError(
-            "A routine calendar event requires a preferred time."
+    try:
+        result = routine_model.invoke(prompt)
+    except Exception:
+        clarification = (
+            "I couldn't quite understand that routine. Could you "
+            "rephrase it with what it is, how often, and roughly "
+            "what time?"
         )
+        return {
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "routine_agent", "content": clarification}
+            ],
+        }
 
-    preferred_time = time.fromisoformat(
-        result.preferred_time
-    )
-
-    recurrence_rule = _build_recurrence_rule(
-        result.frequency,
-        result.days_of_week,
-    )
-
-    start_datetime = _get_next_occurrence(
-        result.frequency,
-        preferred_time,
-        result.days_of_week,
-    )
+    try:
+        preferred_time, recurrence_rule, start_datetime = (
+            _resolve_routine_schedule(result)
+        )
+    except TopicSwitchDetected as switch:
+        return {
+            "user_request": switch.new_request,
+            "topic_switch": True,
+        }
 
     end_datetime = (
         start_datetime

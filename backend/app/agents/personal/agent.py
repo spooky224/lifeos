@@ -50,6 +50,9 @@ Available intents:
    - "I want to gain 10kg next month."
    - "I want to prepare for my AI certification."
    - "Create a goal to improve my fitness."
+   - "Add another task to my AI project."
+   - "What's left on my AI project?"
+   - "Show me my goals."
 
 2. task_create
    The user wants to create a new one-time task.
@@ -113,10 +116,24 @@ User request:
 Return the structured intent only.
 """
 
-    result = intent_model.invoke(prompt)
+    try:
+        result = intent_model.invoke(prompt)
+    except Exception:
+        clarification = (
+            "I didn't quite understand that. Could you rephrase it?"
+        )
+        return {
+            "intent": "other",
+            "topic_switch": False,
+            "final_response": clarification,
+            "messages": state.get("messages", []) + [
+                {"role": "personal_agent", "content": clarification}
+            ],
+        }
 
     return {
         "intent": result.intent,
+        "topic_switch": False,
         "messages": state.get("messages", []) + [
             {
                 "role": "personal_agent",

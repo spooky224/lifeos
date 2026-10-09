@@ -176,4 +176,144 @@ class LifecycleService:
         return actions
     
     
+    # ------------------------------------------------------------------
+    # Notifications (user-facing, non-blocking)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clock(dt: datetime) -> str:
+        return dt.astimezone(LIFEOS_TIMEZONE).strftime("%H:%M")
+
+    def list_notifications(self) -> list[dict]:
+        """
+        Derive the notifications the user should see RIGHT NOW from
+        real database state. Nothing is stored: once the user resolves
+        an item (or its state changes), it simply stops being reported.
+        """
+
+        now = datetime.now(LIFEOS_TIMEZONE)
+        notifications = []
+
+        for task in self.task_repository.list_all():
+            if task.status not in {
+                TaskStatus.SCHEDULED,
+                TaskStatus.IN_PROGRESS,
+            }:
+                continue
+
+            for event in self.calendar_event_repository.list_by_task(
+                task.id
+            ):
+                window = (
+                    f"{self._clock(event.start_time)}–"
+                    f"{self._clock(event.end_time)}"
+                )
+
+                if (
+                    task.status == TaskStatus.SCHEDULED
+                    and task.actual_start is None
+                    and event.start_time <= now < event.end_time
+                ):
+                    kind = "due_now"
+                    message = (
+                        f"It's time for '{task.title}' ({window}). "
+                        "Have you started?"
+                    )
+                    actions = ["start", "reschedule", "cancelled"]
+
+                elif (
+                    task.status == TaskStatus.SCHEDULED
+                    and task.actual_start is None
+                    and event.end_time < now
+                ):
+                    kind = "overdue_unstarted"
+                    message = (
+                        f"'{task.title}' was scheduled for {window} "
+                        "but was never started."
+                    )
+                    actions = [
+                        "completed",
+                        "missed",
+                        "reschedule",
+                        "cancelled",
+                    ]
+
+                elif (
+                    task.status == TaskStatus.IN_PROGRESS
+                    and task.actual_end is None
+                    and event.end_time < now
+                ):
+                    kind = "overdue_in_progress"
+                    message = (
+                        f"'{task.title}' is still in progress past its "
+                        f"scheduled end ({self._clock(event.end_time)})."
+                    )
+                    actions = ["completed", "reschedule", "cancelled"]
+
+                else:
+                    continue
+
+                notifications.append({
+                    "id": f"{kind}:{task.id}:{event.id}",
+                    "type": kind,
+                    "task_id": task.id,
+                    "calendar_event_id": event.id,
+                    "title": task.title,
+                    "message": message,
+                    "start_time": event.start_time.isoformat(),
+                    "end_time": event.end_time.isoformat(),
+                    "actions": actions,
+                })
+
+        notifications.sort(key=lambda n: n["end_time"])
+
+        return notifications
+
+    def apply_action(
+        self,
+        task_id: int,
+        action: str,
+    ) -> None:
+        """
+        Execute a notification quick action. Business rules stay in
+        TaskService. The caller commits. 'reschedule' is NOT handled
+        here: it needs a conversation, so the UI hands it to the chat.
+        """
+
+        from app.services.calendar_service import CalendarService
+        from app.services.task_service import TaskService
+
+        task_service = TaskService(self.session)
+        calendar_service = CalendarService(self.session)
+
+        task = task_service.get_task(task_id)
+
+        if task is None:
+            raise ValueError(f"Task #{task_id} not found.")
+
+        if action == "start":
+            task_service.start_task(task_id)
+            return
+
+        if action == "completed":
+            if task.actual_start is not None and task.actual_end is None:
+                task_service.complete_task(task_id)
+            else:
+                task_service.update_status_by_id(
+                    task_id, TaskStatus.COMPLETED
+                )
+
+        elif action == "missed":
+            task_service.update_status_by_id(task_id, TaskStatus.MISSED)
+
+        elif action == "cancelled":
+            task_service.update_status_by_id(task_id, TaskStatus.CANCELLED)
+
+        else:
+            raise ValueError(f"Unsupported action '{action}'.")
+
+        # The task is resolved: its calendar events are now stale.
+        for event in self.calendar_event_repository.list_by_task(task_id):
+            calendar_service.remove_event(event.id)
+    
 
