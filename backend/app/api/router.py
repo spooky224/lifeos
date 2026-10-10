@@ -372,6 +372,10 @@ def chat(request: ChatRequest):
             # Clear turn-scoped outputs from the previous checkpoint.
             # Keep last_task_id / last_goal_id as deliberate reference anchors.
             "intent": None,
+            "coordination_plan": [],
+            "coordination_trace": [],
+            "agent_handoffs": [],
+            "coordination_next_agent": None,
             "task_context": {},
             "goal_context": {},
             "routine_context": {},

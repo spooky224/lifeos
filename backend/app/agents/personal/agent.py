@@ -95,14 +95,25 @@ Available intents:
    - "Move my grocery task to Friday at 10am."
 
 5. task_update
-   The user wants to update the status of an existing task.
+   The user wants to modify an EXISTING task, including its properties
+   or its lifecycle status.
 
-   Examples:
+   Property edits:
+   - "Change its duration to 2 hours."
+   - "Rename the task to Review LangGraph documentation."
+   - "Set that task's priority to high."
+   - "Change the description of my AI task."
+
+   Status changes:
    - "I finished my AI project."
    - "I completed my workout."
    - "I missed my workout."
    - "I postponed my presentation."
    - "I'm working on my AI project."
+   - "Cancel my AI project."
+
+   Do not classify edits to an existing task's title, duration, priority,
+   or description as calendar or conversation requests.
 
 6. conversation
    The user is talking naturally, reflecting, sharing feelings,

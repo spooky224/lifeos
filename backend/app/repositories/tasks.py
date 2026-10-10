@@ -101,6 +101,27 @@ class TaskRepository:
 
         return task
 
+    def update_properties(
+        self,
+        task: Task,
+        *,
+        title: str | None = None,
+        estimated_duration_minutes: int | None = None,
+        priority: str | None = None,
+        description: str | None = None,
+    ) -> Task:
+        if title is not None:
+            task.title = title
+        if estimated_duration_minutes is not None:
+            task.estimated_duration_minutes = estimated_duration_minutes
+        if priority is not None:
+            task.priority = priority
+        if description is not None:
+            task.description = description
+
+        self.session.flush()
+        return task
+
     def update_deadline(
         self,
         task: Task,

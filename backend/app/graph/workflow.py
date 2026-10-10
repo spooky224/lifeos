@@ -7,6 +7,7 @@ from langgraph.types import interrupt
 from app.tools.calendar.create_event import create_calendar_event
 from app.services.google_calendar import update_event
 from app.graph.state import LifeOSState
+from app.graph.coordination import build_coordination_plan, make_handoff
 
 from app.db.session import SessionLocal
 
@@ -102,6 +103,85 @@ def route_after_personal(state: LifeOSState):
 
     # Ordinary dialogue is a valid outcome, not a rejected action.
     return "conversation_agent"
+
+
+
+def coordination_agent(state: LifeOSState) -> LifeOSState:
+    """Plan the specialist chain after intent classification."""
+    intent = state.get("intent", "conversation")
+    plan = build_coordination_plan(intent)
+    return {
+        "coordination_plan": plan,
+        "coordination_trace": [{"stage": "plan", "intent": intent, "steps": plan}],
+        "agent_handoffs": [],
+        "coordination_next_agent": route_after_personal(state),
+        "schedule_requested": False,
+    }
+
+
+def _handoff(state: LifeOSState, source: str, target: str, payload: dict) -> LifeOSState:
+    record = make_handoff(source, target, payload)
+    return {
+        "agent_handoffs": state.get("agent_handoffs", []) + [record],
+        "coordination_trace": state.get("coordination_trace", []) + [{
+            "stage": "handoff", "from_agent": source, "to_agent": target,
+        }],
+        "coordination_next_agent": target,
+    }
+
+
+def goal_handoff(state: LifeOSState) -> LifeOSState:
+    task = state.get("task_context") or {}
+    should_schedule = state.get("schedule_requested", False) and task.get("task_id") is not None
+    return _handoff(state, "goal_agent", "calendar_agent" if should_schedule else END, {
+        "goal_context": state.get("goal_context"),
+        "task_context": task or None,
+        "schedule_requested": bool(state.get("schedule_requested", False)),
+    })
+
+
+def task_handoff(state: LifeOSState) -> LifeOSState:
+    task = state.get("task_context") or {}
+    should_schedule = (
+        state.get("intent") == "task_create"
+        and state.get("schedule_requested", False)
+        and task.get("task_id") is not None
+    )
+    return _handoff(state, "task_agent", "calendar_agent" if should_schedule else END, {
+        "task_context": task or None,
+        "schedule_requested": bool(state.get("schedule_requested", False)),
+    })
+
+
+def routine_handoff(state: LifeOSState) -> LifeOSState:
+    actions = state.get("proposed_actions") or []
+    return _handoff(state, "routine_agent", "approval" if actions else END, {
+        "routine_context": state.get("routine_context"),
+        "proposed_action_count": len(actions),
+        "proposal_types": [item.get("type") for item in actions],
+    })
+
+
+def calendar_handoff(state: LifeOSState) -> LifeOSState:
+    actions = state.get("proposed_actions") or []
+    summaries = [{
+        key: action.get(key)
+        for key in ("type", "task_id", "routine_id", "title", "start", "end")
+        if action.get(key) is not None
+    } for action in actions]
+    return _handoff(state, "calendar_agent", "approval" if actions else END, {
+        "task_context": state.get("task_context"),
+        "calendar_context": state.get("calendar_context"),
+        "proposed_actions": summaries,
+    })
+
+
+def route_after_handoff(state: LifeOSState):
+    return state.get("coordination_next_agent") or END
+
+
+def route_after_coordinator(state: LifeOSState):
+    return state.get("coordination_next_agent") or "conversation_agent"
 
 def execute_calendar_action(
     state: LifeOSState,
@@ -474,6 +554,11 @@ def build_graph():
         "personal_agent",
         personal_agent,
     )
+    graph.add_node("coordination_agent", coordination_agent)
+    graph.add_node("goal_handoff", goal_handoff)
+    graph.add_node("task_handoff", task_handoff)
+    graph.add_node("routine_handoff", routine_handoff)
+    graph.add_node("calendar_handoff", calendar_handoff)
 
     graph.add_node(
         "conversation_agent",
@@ -541,9 +626,10 @@ def build_graph():
     # PERSONAL AGENT ROUTING
     # =========================================================
     
+    graph.add_edge("personal_agent", "coordination_agent")
     graph.add_conditional_edges(
-        "personal_agent",
-        route_after_personal,
+        "coordination_agent",
+        route_after_coordinator,
         {
             "goal_agent": "goal_agent",
             "routine_agent": "routine_agent",
@@ -558,35 +644,30 @@ def build_graph():
     # GOAL → CALENDAR (or END if scheduling wasn't requested)
     # =========================================================
 
+    graph.add_edge("goal_agent", "goal_handoff")
     graph.add_conditional_edges(
-        "goal_agent",
-        route_after_goal,
-        {
-            "calendar_agent": "calendar_agent",
-            END: END,
-        },
+        "goal_handoff", route_after_handoff,
+        {"calendar_agent": "calendar_agent", END: END},
     )
 
     # =========================================================
     # ROUTINE → APPROVAL
     # =========================================================
 
-    graph.add_edge(
-        "routine_agent",
-        "approval",
+    graph.add_edge("routine_agent", "routine_handoff")
+    graph.add_conditional_edges(
+        "routine_handoff", route_after_handoff,
+        {"approval": "approval", END: END},
     )
 
     # =========================================================
     # CALENDAR → APPROVAL (or END if clarification is needed)
     # =========================================================
 
+    graph.add_edge("calendar_agent", "calendar_handoff")
     graph.add_conditional_edges(
-        "calendar_agent",
-        route_after_calendar,
-        {
-            "approval": "approval",
-            END: END,
-        },
+        "calendar_handoff", route_after_handoff,
+        {"approval": "approval", END: END},
     )
 
     # =========================================================
@@ -614,13 +695,10 @@ def build_graph():
         END,
     )
     
+    graph.add_edge("task_agent", "task_handoff")
     graph.add_conditional_edges(
-        "task_agent",
-        route_after_task,
-        {
-            "calendar_agent": "calendar_agent",
-            END: END,
-        },
+        "task_handoff", route_after_handoff,
+        {"calendar_agent": "calendar_agent", END: END},
     )
 
     graph.add_edge(

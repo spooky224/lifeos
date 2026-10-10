@@ -78,6 +78,41 @@ class TaskService:
             new_status,
         )
 
+    def update_task_properties(
+        self,
+        task_id: int,
+        *,
+        title: str | None = None,
+        estimated_duration_minutes: int | None = None,
+        priority: str | None = None,
+        description: str | None = None,
+    ) -> Task:
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"Task #{task_id} not found.")
+
+        if title is not None and not title.strip():
+            raise ValueError("Task title cannot be empty.")
+        if title is not None and len(title.strip()) > 200:
+            raise ValueError("Task title cannot exceed 200 characters.")
+        if (
+            estimated_duration_minutes is not None
+            and estimated_duration_minutes <= 0
+        ):
+            raise ValueError("Task duration must be greater than zero.")
+        if priority is not None and priority not in {
+            "low", "medium", "high"
+        }:
+            raise ValueError("Priority must be low, medium, or high.")
+
+        return self.task_repository.update_properties(
+            task,
+            title=title.strip() if title is not None else None,
+            estimated_duration_minutes=estimated_duration_minutes,
+            priority=priority,
+            description=description,
+        )
+
     def update_status_by_id(
         self,
         task_id: int,

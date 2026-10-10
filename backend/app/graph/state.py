@@ -10,6 +10,12 @@ class LifeOSState(TypedDict, total=False):
     # Understanding
     intent: str
 
+    # Multi-agent coordination
+    coordination_plan: list[str]
+    coordination_trace: list[dict[str, Any]]
+    agent_handoffs: list[dict[str, Any]]
+    coordination_next_agent: str
+
     # Domain contexts
     task_context: dict[str, Any]
     goal_context: dict[str, Any]
